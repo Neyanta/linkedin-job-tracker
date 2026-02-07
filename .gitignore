@@ -1,0 +1,29 @@
+# Credentials - NEVER commit these!
+credentials.json
+
+# Keep the job data backup in repo (optional - comment out if you want to exclude)
+# linkedin_pm_jobs.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Job data
+linkedin_pm_jobs.json
+linkedin_jobs.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
