@@ -17,7 +17,12 @@ class LinkedInJobTracker:
     def __init__(self, use_sheets=False, sheet_name="LinkedIn PM Jobs"):
         self.base_url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.linkedin.com/jobs/',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
         }
         self.jobs = []
         self.use_sheets = use_sheets
@@ -53,15 +58,15 @@ class LinkedInJobTracker:
                 self.spreadsheet = client.create(self.sheet_name)
                 self.sheet = self.spreadsheet.sheet1
                 
-                # Set up headers
+                # Set up headers (Description at end for Agent 2 resume customization)
                 headers = [
                     'Job ID', 'Title', 'Company', 'Location', 
-                    'Link', 'Found Date', 'Status', 'Notes'
+                    'Link', 'Found Date', 'Status', 'Notes', 'Description'
                 ]
-                self.sheet.update('A1:H1', [headers])
+                self.sheet.update('A1:I1', [headers])
                 
                 # Format header row
-                self.sheet.format('A1:H1', {
+                self.sheet.format('A1:I1', {
                     'textFormat': {'bold': True},
                     'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.9}
                 })
@@ -77,45 +82,71 @@ class LinkedInJobTracker:
             print(f"❌ Error setting up Google Sheets: {str(e)}")
             self.use_sheets = False
     
-    def search_jobs(self, keywords="product manager", location="", num_jobs=25):
+    def search_jobs(self, keywords="product manager", location="", num_jobs=50):
         """
         Search for jobs on LinkedIn
         
         Args:
             keywords: Job search keywords (default: "product manager")
-            location: Location filter (e.g., "San Francisco, CA" or leave empty for remote/all)
-            num_jobs: Number of jobs to fetch (default: 25)
+            location: Location filter - string only (e.g., "India" or "San Francisco, CA")
+            num_jobs: Number of jobs to fetch (default: 50)
         """
-        print(f"🔍 Searching for '{keywords}' jobs...")
+        # Ensure location is a single string (API ignores/breaks with list)
+        if isinstance(location, list):
+            location = location[0] if location else ""
         
-        params = {
-            'keywords': keywords,
-            'location': location,
-            'start': 0
-        }
+        print(f"🔍 Searching for '{keywords}' jobs" + (f" in {location}" if location else "") + "...")
+        
+        self.jobs = []
+        jobs_per_page = 25
+        start = 0
         
         try:
-            response = requests.get(
-                self.base_url,
-                params=params,
-                headers=self.headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
+            while len(self.jobs) < num_jobs:
+                params = {
+                    'keywords': keywords,
+                    'location': location,
+                    'start': start,
+                    'f_TPR': 'r604800',  # Past 7 days
+                }
+                
+                response = requests.get(
+                    self.base_url,
+                    params=params,
+                    headers=self.headers,
+                    timeout=15
+                )
+                
+                if response.status_code != 200:
+                    print(f"❌ Error: Status code {response.status_code}")
+                    break
+                
                 soup = BeautifulSoup(response.text, 'html.parser')
                 job_cards = soup.find_all('li')
                 
-                for card in job_cards[:num_jobs]:
+                if not job_cards:
+                    print(f"   No more results at start={start}")
+                    break
+                
+                page_count = 0
+                for card in job_cards:
+                    if len(self.jobs) >= num_jobs:
+                        break
                     job_data = self._parse_job_card(card)
                     if job_data:
                         self.jobs.append(job_data)
+                        page_count += 1
                 
-                print(f"✅ Found {len(self.jobs)} jobs")
-                return self.jobs
-            else:
-                print(f"❌ Error: Status code {response.status_code}")
-                return []
+                print(f"   Fetched page {start // jobs_per_page + 1}: +{page_count} jobs (total: {len(self.jobs)})")
+                
+                if page_count < jobs_per_page:
+                    break
+                
+                start += jobs_per_page
+                time.sleep(2)  # Rate limiting between pages
+            
+            print(f"✅ Found {len(self.jobs)} jobs")
+            return self.jobs
                 
         except Exception as e:
             print(f"❌ Error fetching jobs: {str(e)}")
@@ -138,8 +169,8 @@ class LinkedInJobTracker:
             company = company_elem.text.strip() if company_elem else "Unknown"
             location = location_elem.text.strip() if location_elem else "Unknown"
             
-            # Extract job ID from URL
-            job_id_match = re.search(r'/jobs/view/(\d+)', job_link)
+            # Extract job ID from URL (format: .../jobs/view/title-company-1234567890)
+            job_id_match = re.search(r'-(\d+)(?:\?|$)', job_link) or re.search(r'/(\d+)(?:\?|$)', job_link)
             job_id = job_id_match.group(1) if job_id_match else None
             
             return {
@@ -155,6 +186,59 @@ class LinkedInJobTracker:
             
         except Exception as e:
             print(f"⚠️  Error parsing job card: {str(e)}")
+            return None
+    
+    def fetch_job_description(self, job_id):
+        """
+        Fetch full job description from LinkedIn's job posting API (no login required).
+        Returns text including Job Overview, What You Will Do, Skills, etc.
+        """
+        if not job_id:
+            return None
+        try:
+            url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+            response = requests.get(url, headers=self.headers, timeout=15)
+            if response.status_code != 200:
+                return None
+            html = response.text
+            if not html or len(html) < 500:
+                return None
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Try common LinkedIn description containers (class names may vary)
+            desc_div = (
+                soup.find('div', class_='description__text') or
+                soup.find('div', class_='show-more-less-html__markup') or
+                soup.find('section', class_='description') or
+                soup.find('div', class_='job-view-layout jobs-details')
+            )
+            if desc_div:
+                text = desc_div.get_text(strip=True, separator='\n')
+                if len(text) >= 100:
+                    return text
+            
+            # Fallback: extract from full page text between known markers
+            full_text = soup.get_text(separator='\n', strip=True)
+            end_pattern = r'(?:Show more|Seniority level|Employment type|Job function|Industries|Referrals|Featured Benefits)'
+            for start in ['Job Description', 'Job Overview', 'About the job']:
+                match = re.search(
+                    f'({re.escape(start)}).*?(?={end_pattern})',
+                    full_text,
+                    re.DOTALL | re.IGNORECASE
+                )
+                if match:
+                    text = match.group(0).strip()
+                    if len(text) >= 200:
+                        return text
+            
+            # Last resort: get body text if it looks like job content
+            body = soup.find('body')
+            if body:
+                text = body.get_text(strip=True, separator='\n')
+                if len(text) >= 500 and any(kw in text.lower() for kw in ['responsibilities', 'experience', 'product', 'skills']):
+                    return text
+            return None
+        except Exception:
             return None
     
     def filter_product_management(self):
@@ -187,26 +271,50 @@ class LinkedInJobTracker:
         self.jobs = filtered_jobs
         return filtered_jobs
     
-    def save_to_sheets(self):
-        """Save jobs to Google Sheets"""
+    def save_to_sheets(self, fetch_descriptions=True, max_description_fetches=20):
+        """
+        Save jobs to Google Sheets.
+        fetch_descriptions: If True, fetches job descriptions via LinkedIn API
+        max_description_fetches: Limit fetches per run to avoid rate limits (default 20)
+        """
         if not self.use_sheets or not self.sheet:
             print("❌ Google Sheets not configured")
             return
         
         try:
-            # Get existing job IDs from sheet
+            # Ensure Description column exists (for existing sheets)
             existing_data = self.sheet.get_all_values()
+            headers = existing_data[0] if existing_data else []
+            if 'Description' not in headers:
+                desc_col = len(headers) + 1
+                self.sheet.update_cell(1, desc_col, 'Description')
+                print("   Added Description column to sheet")
+            
             existing_ids = set()
+            if len(existing_data) > 1:
+                for row in existing_data[1:]:
+                    if row and row[0]:
+                        existing_ids.add(str(row[0]))
+                    if len(row) > 4 and row[4]:
+                        existing_ids.add(row[4])
             
-            if len(existing_data) > 1:  # Has data beyond header
-                for row in existing_data[1:]:  # Skip header
-                    if row and row[0]:  # Has job ID
-                        existing_ids.add(row[0])
-            
-            # Prepare new rows
+            # Prepare new rows (with descriptions)
             new_rows = []
+            fetch_count = 0
             for job in self.jobs:
-                if job['job_id'] not in existing_ids:
+                job_id = job.get('job_id') or job.get('link', '')
+                if job_id not in existing_ids and job.get('link') not in existing_ids:
+                    description = ''
+                    if fetch_descriptions and job.get('job_id') and fetch_count < max_description_fetches:
+                        print(f"   Fetching description for {job.get('title', '')[:40]}...")
+                        description = self.fetch_job_description(job['job_id']) or ''
+                        fetch_count += 1
+                        if description:
+                            print(f"      ✓ Got {len(description)} chars")
+                        else:
+                            print(f"      ⚠ No description")
+                        time.sleep(2)  # Rate limiting
+                    
                     row = [
                         job['job_id'],
                         job['title'],
@@ -215,20 +323,19 @@ class LinkedInJobTracker:
                         job['link'],
                         job['found_date'],
                         job['status'],
-                        job['notes']
+                        job['notes'],
+                        description
                     ]
                     new_rows.append(row)
             
             if new_rows:
-                # Append new rows
                 self.sheet.append_rows(new_rows)
                 print(f"📊 Added {len(new_rows)} new jobs to Google Sheets")
                 print(f"🔗 View your sheet: {self.spreadsheet.url}")
             else:
                 print("ℹ️  No new jobs to add (all jobs already in sheet)")
             
-            # Get total count
-            total_jobs = len(self.sheet.get_all_values()) - 1  # Minus header
+            total_jobs = len(self.sheet.get_all_values()) - 1
             print(f"📈 Total jobs tracked: {total_jobs}")
             
         except Exception as e:
@@ -245,9 +352,13 @@ class LinkedInJobTracker:
             except FileNotFoundError:
                 pass
             
-            # Merge with new jobs (avoid duplicates by job_id)
-            existing_ids = {job.get('job_id') for job in existing_jobs}
-            new_jobs = [job for job in self.jobs if job.get('job_id') not in existing_ids]
+            # Merge with new jobs (avoid duplicates by job_id or link)
+            existing_ids = {str(j.get('job_id')) for j in existing_jobs if j.get('job_id')}
+            existing_links = {j.get('link') for j in existing_jobs if j.get('link')}
+            new_jobs = [
+                job for job in self.jobs
+                if job.get('job_id') not in existing_ids and job.get('link') not in existing_links
+            ]
             
             all_jobs = existing_jobs + new_jobs
             
@@ -297,11 +408,11 @@ def main():
     )
     
     # Search for jobs
-    # Customize these parameters:
+    # Customize: location must be a single string (e.g. "India", "Bangalore", "Remote")
     tracker.search_jobs(
         keywords="product manager",
-        location="",  # Leave empty for all locations, or specify like "San Francisco, CA"
-        num_jobs=50   # Number of jobs to fetch
+        location="India",
+        num_jobs=100   # Number of jobs to fetch
     )
     
     # Filter for product management roles
